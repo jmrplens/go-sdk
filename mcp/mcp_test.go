@@ -4464,3 +4464,521 @@ func TestResourceSubscriptions_GenGuard(t *testing.T) {
 		t.Fatal("clearing an absent URI reported a deletion")
 	}
 }
+
+// endedCall is one call to a ResourceSubscriptionEndedHandler, with whether
+// the URI was still subscribed when it was made.
+type endedCall struct {
+	req             *ResourceSubscriptionEndedRequest
+	stillSubscribed bool
+}
+
+// endedRecorder records the calls to a ResourceSubscriptionEndedHandler.
+type endedRecorder struct {
+	mu    sync.Mutex
+	calls []endedCall
+}
+
+func (r *endedRecorder) handler(_ context.Context, req *ResourceSubscriptionEndedRequest) {
+	still := hasResourceSub(req.Session, req.URI)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, endedCall{req: req, stillSubscribed: still})
+}
+
+func (r *endedRecorder) get() []endedCall {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.calls)
+}
+
+// refusingResourceServer returns a server that advertises resource
+// subscriptions and refuses every one of them.
+func refusingResourceServer() *Server {
+	s := NewServer(testImpl, &ServerOptions{
+		SubscribeHandler: func(_ context.Context, r *SubscribeRequest) error {
+			return ResourceNotFoundError(r.Params.URI)
+		},
+		UnsubscribeHandler: func(context.Context, *UnsubscribeRequest) error { return nil },
+	})
+	s.AddResource(&Resource{Name: "r1", URI: "file:///r1"}, nil)
+	return s
+}
+
+// TestResourceSubscriptionEndedHandler_Refused verifies that a client is told
+// when the server refuses a resource subscription. Before 2026-07-28 Subscribe
+// returns the refusal itself. From 2026-07-28 Subscribe returns before the
+// server answers the subscriptions/listen it opens, so the refusal reaches the
+// handler instead, after the URI has stopped being subscribed.
+func TestResourceSubscriptionEndedHandler_Refused(t *testing.T) {
+	for _, version := range []string{protocolVersion20251125, protocolVersion20260728} {
+		t.Run(version, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := context.Background()
+				ct, st := NewInMemoryTransports()
+				ss, err := refusingResourceServer().Connect(ctx, st, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer ss.Close()
+
+				var rec endedRecorder
+				c := NewClient(testImpl, &ClientOptions{ResourceSubscriptionEndedHandler: rec.handler})
+				cs, err := c.Connect(ctx, ct, &ClientSessionOptions{ProtocolVersion: version})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer cs.Close()
+
+				subscribeErr := cs.Subscribe(ctx, &SubscribeParams{URI: "file:///r1"})
+				synctest.Wait()
+				calls := rec.get()
+
+				refusal := subscribeErr
+				if version == protocolVersion20251125 {
+					if len(calls) != 0 {
+						t.Errorf("handler called %d times, want 0: Subscribe reports the refusal", len(calls))
+					}
+				} else {
+					if subscribeErr != nil {
+						t.Errorf("Subscribe = %v, want nil: it does not wait for the listen", subscribeErr)
+					}
+					if len(calls) != 1 {
+						t.Fatalf("handler called %d times, want 1", len(calls))
+					}
+					got := calls[0]
+					if got.req.Session != cs {
+						t.Error("the request names another session")
+					}
+					if got.req.URI != "file:///r1" {
+						t.Errorf("URI = %q, want file:///r1", got.req.URI)
+					}
+					if got.req.Graceful {
+						t.Error("Graceful = true for a refused subscription")
+					}
+					if got.stillSubscribed {
+						t.Error("the URI was still subscribed when the handler ran")
+					}
+					refusal = got.req.Err
+				}
+				var rpcErr *jsonrpc.Error
+				if !errors.As(refusal, &rpcErr) || rpcErr.Code != CodeResourceNotFound {
+					t.Errorf("refusal = %v, want the server's error with code %d", refusal, CodeResourceNotFound)
+				}
+			})
+		})
+	}
+}
+
+// TestResourceSubscriptionEndedHandler_RefusedOverStreamable verifies that the
+// server's refusal reaches the handler over the streamable transport, both when
+// the refused listen is answered with a non-2xx status, as a go-sdk server
+// answers it, and when the refusal arrives on a 200 event stream.
+func TestResourceSubscriptionEndedHandler_RefusedOverStreamable(t *testing.T) {
+	server := refusingResourceServer()
+	backend := mustNotPanic(t, NewStreamableHTTPHandler(
+		func(*http.Request) *Server { return server },
+		&StreamableHTTPOptions{Stateless: true},
+	))
+	tests := []struct {
+		name    string
+		handler http.Handler
+	}{
+		{"status", backend},
+		{"event stream", refuseListenOnTheStream(backend)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			httpServer := httptest.NewServer(test.handler)
+			t.Cleanup(httpServer.Close)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			ended := make(chan *ResourceSubscriptionEndedRequest, 4)
+			c := NewClient(testImpl, &ClientOptions{
+				ResourceSubscriptionEndedHandler: func(_ context.Context, req *ResourceSubscriptionEndedRequest) {
+					ended <- req
+				},
+			})
+			cs, err := c.Connect(ctx, &StreamableClientTransport{Endpoint: httpServer.URL, DisableStandaloneSSE: true},
+				&ClientSessionOptions{ProtocolVersion: protocolVersion20260728})
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			t.Cleanup(func() { cs.Close() })
+
+			if err := cs.Subscribe(ctx, &SubscribeParams{URI: "file:///r1"}); err != nil {
+				t.Fatalf("Subscribe = %v, want nil", err)
+			}
+			select {
+			case got := <-ended:
+				if got.URI != "file:///r1" || got.Session != cs || got.Graceful {
+					t.Errorf("got URI %q, own session %t, Graceful %t; want file:///r1, true, false", got.URI, got.Session == cs, got.Graceful)
+				}
+				var rpcErr *jsonrpc.Error
+				if !errors.As(got.Err, &rpcErr) || rpcErr.Code != CodeResourceNotFound {
+					t.Errorf("Err = %v, want the server's error with code %d", got.Err, CodeResourceNotFound)
+				}
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for the handler")
+			}
+		})
+	}
+}
+
+// refuseListenOnTheStream wraps a streamable handler so that a
+// subscriptions/listen carrying resource subscriptions is answered with 200 and
+// an event stream whose one message is a JSON-RPC error, the shape some servers
+// use instead of a non-2xx status.
+func refuseListenOnTheStream(backend http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, err := io.ReadAll(r.Body)
+			r.Body.Close()
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var msg struct {
+				Method string          `json:"method"`
+				ID     json.RawMessage `json:"id"`
+				Params struct {
+					Notifications struct {
+						ResourceSubscriptions []string `json:"resourceSubscriptions"`
+					} `json:"notifications"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(body, &msg) == nil && msg.Method == methodSubscriptionsListen &&
+				len(msg.Params.Notifications.ResourceSubscriptions) > 0 {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				fmt.Fprintf(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":%s,\"error\":{\"code\":%d,\"message\":\"Resource not found\"}}\n\n",
+					msg.ID, CodeResourceNotFound)
+				return
+			}
+		}
+		backend.ServeHTTP(w, r)
+	})
+}
+
+// TestResourceSubscriptionEndedHandler_ConnectionClosed verifies that the
+// handler reports a subscription whose connection the server closed, and that
+// subscribing again on that session ends at once with an error wrapping
+// ErrConnectionClosed, which is what a handler can stop on.
+//
+// ServerSession.Close ends its listens with a result before it closes the
+// connection, so the first report carries either that result or the read
+// error, whichever reaches the client first.
+func TestResourceSubscriptionEndedHandler_ConnectionClosed(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		server := resourceSubServer(t, make(chan string, 8), make(chan string, 8))
+		ct, st := NewInMemoryTransports()
+		ss, err := server.Connect(ctx, st, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var rec endedRecorder
+		c := NewClient(testImpl, &ClientOptions{
+			ResourceSubscriptionEndedHandler: func(ctx context.Context, req *ResourceSubscriptionEndedRequest) {
+				rec.handler(ctx, req)
+				if len(rec.get()) == 1 {
+					req.Session.Subscribe(ctx, &SubscribeParams{URI: req.URI})
+				}
+			},
+		})
+		cs, err := c.Connect(ctx, ct, &ClientSessionOptions{ProtocolVersion: protocolVersion20260728})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+
+		if err := cs.Subscribe(ctx, &SubscribeParams{URI: "file:///r1"}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		ss.Close()
+		synctest.Wait()
+
+		calls := rec.get()
+		if len(calls) != 2 {
+			t.Fatalf("handler called %d times, want 2: once for the closed connection, once for the subscription made after it", len(calls))
+		}
+		if first := calls[0].req; first.URI != "file:///r1" || first.Graceful != (first.Err == nil) {
+			t.Errorf("first call: URI %q, Err = %v, Graceful = %t; want file:///r1 with the server's result or the read error", first.URI, first.Err, first.Graceful)
+		}
+		if !errors.Is(calls[1].req.Err, ErrConnectionClosed) {
+			t.Errorf("second call: Err = %v, want it to wrap ErrConnectionClosed", calls[1].req.Err)
+		}
+	})
+}
+
+// TestResourceSubscriptionEndedHandler_SubscribeAfterClose verifies that a
+// Subscribe made after the client closed its session does not fail silently.
+// Today Subscribe returns nil and the listen it starts fails, so the handler
+// reports it with an error wrapping ErrConnectionClosed. Issue #1171 asks for
+// Subscribe to return that error itself, which this test also accepts.
+func TestResourceSubscriptionEndedHandler_SubscribeAfterClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		server := resourceSubServer(t, make(chan string, 8), make(chan string, 8))
+		ct, st := NewInMemoryTransports()
+		ss, err := server.Connect(ctx, st, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ss.Close()
+
+		var rec endedRecorder
+		c := NewClient(testImpl, &ClientOptions{ResourceSubscriptionEndedHandler: rec.handler})
+		cs, err := c.Connect(ctx, ct, &ClientSessionOptions{ProtocolVersion: protocolVersion20260728})
+		if err != nil {
+			t.Fatal(err)
+		}
+		cs.Close()
+
+		subscribeErr := cs.Subscribe(ctx, &SubscribeParams{URI: "file:///r1"})
+		synctest.Wait()
+		calls := rec.get()
+
+		if subscribeErr != nil {
+			if !errors.Is(subscribeErr, ErrConnectionClosed) {
+				t.Errorf("Subscribe = %v, want an error wrapping ErrConnectionClosed", subscribeErr)
+			}
+			if len(calls) != 0 {
+				t.Errorf("handler called %d times after Subscribe returned an error, want 0", len(calls))
+			}
+			return
+		}
+		if len(calls) != 1 {
+			t.Fatalf("Subscribe = nil and handler called %d times, want 1", len(calls))
+		}
+		if got := calls[0].req; !errors.Is(got.Err, ErrConnectionClosed) || got.Graceful || got.URI != "file:///r1" {
+			t.Errorf("got URI %q, Err %v, Graceful %t; want file:///r1, an error wrapping ErrConnectionClosed, false", got.URI, got.Err, got.Graceful)
+		}
+	})
+}
+
+// TestResourceSubscriptionEndedHandler_ServerEndsTheStream verifies that the
+// handler reports a listen the server ends after accepting it, abruptly or with
+// a result, and says which.
+func TestResourceSubscriptionEndedHandler_ServerEndsTheStream(t *testing.T) {
+	for _, graceful := range []bool{false, true} {
+		name := "abrupt"
+		if graceful {
+			name = "graceful"
+		}
+		t.Run(name, func(t *testing.T) {
+			server := resourceSubServer(t, make(chan string, 8), make(chan string, 8))
+			drop := newListenDropServer(t, "file:///r1", server)
+			drop.arm(graceful)
+			httpServer := httptest.NewServer(drop)
+			t.Cleanup(httpServer.Close)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+
+			ended := make(chan *ResourceSubscriptionEndedRequest, 4)
+			c := NewClient(testImpl, &ClientOptions{
+				ResourceSubscriptionEndedHandler: func(_ context.Context, req *ResourceSubscriptionEndedRequest) {
+					ended <- req
+				},
+			})
+			cs, err := c.Connect(ctx, &StreamableClientTransport{Endpoint: httpServer.URL, DisableStandaloneSSE: true},
+				&ClientSessionOptions{ProtocolVersion: protocolVersion20260728})
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			t.Cleanup(func() {
+				cs.Close()
+				httpServer.CloseClientConnections()
+			})
+
+			if err := cs.Subscribe(ctx, &SubscribeParams{URI: "file:///r1"}); err != nil {
+				t.Fatalf("Subscribe = %v, want nil", err)
+			}
+			select {
+			case got := <-ended:
+				if got.URI != "file:///r1" || got.Session != cs {
+					t.Errorf("got URI %q, own session %t; want file:///r1, true", got.URI, got.Session == cs)
+				}
+				if got.Graceful != graceful {
+					t.Errorf("Graceful = %t, want %t", got.Graceful, graceful)
+				}
+				if (got.Err == nil) != graceful {
+					t.Errorf("Err = %v, want an error only for an abrupt end", got.Err)
+				}
+			case <-ctx.Done():
+				t.Fatal("timed out waiting for the handler")
+			}
+		})
+	}
+}
+
+// TestResourceSubscriptionEndedHandler_SubscribeFromTheHandler verifies that
+// the handler can subscribe to the URI again, which opens a new listen.
+func TestResourceSubscriptionEndedHandler_SubscribeFromTheHandler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		var asked atomic.Int32
+		server := NewServer(testImpl, &ServerOptions{
+			SubscribeHandler: func(_ context.Context, r *SubscribeRequest) error {
+				if asked.Add(1) == 1 {
+					return ResourceNotFoundError(r.Params.URI)
+				}
+				return nil
+			},
+			UnsubscribeHandler: func(context.Context, *UnsubscribeRequest) error { return nil },
+		})
+		server.AddResource(&Resource{Name: "r1", URI: "file:///r1"}, nil)
+		ct, st := NewInMemoryTransports()
+		ss, err := server.Connect(ctx, st, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ss.Close()
+
+		var ended atomic.Int32
+		resubscribed := make(chan error, 1)
+		c := NewClient(testImpl, &ClientOptions{
+			ResourceSubscriptionEndedHandler: func(ctx context.Context, req *ResourceSubscriptionEndedRequest) {
+				ended.Add(1)
+				resubscribed <- req.Session.Subscribe(ctx, &SubscribeParams{URI: req.URI})
+			},
+		})
+		cs, err := c.Connect(ctx, ct, &ClientSessionOptions{ProtocolVersion: protocolVersion20260728})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+
+		if err := cs.Subscribe(ctx, &SubscribeParams{URI: "file:///r1"}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		select {
+		case err := <-resubscribed:
+			if err != nil {
+				t.Errorf("Subscribe from the handler = %v, want nil", err)
+			}
+		default:
+			t.Error("the handler was not called")
+		}
+		if n := asked.Load(); n != 2 {
+			t.Errorf("server asked to subscribe %d times, want 2", n)
+		}
+		if n := ended.Load(); n != 1 {
+			t.Errorf("handler called %d times, want 1: the second listen is still open", n)
+		}
+		if !hasResourceSub(cs, "file:///r1") {
+			t.Error("the URI is not subscribed after subscribing from the handler")
+		}
+	})
+}
+
+// TestResourceSubscriptionEndedHandler_NotCalledOnUnsubscribeOrClose verifies
+// that a listen the client ends itself is not reported.
+func TestResourceSubscriptionEndedHandler_NotCalledOnUnsubscribeOrClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		subCh := make(chan string, 8)
+		unsubCh := make(chan string, 8)
+		server := resourceSubServer(t, subCh, unsubCh)
+		server.AddResource(&Resource{Name: "r2", URI: "file:///r2"}, nil)
+		ct, st := NewInMemoryTransports()
+		ss, err := server.Connect(ctx, st, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ss.Close()
+
+		var rec endedRecorder
+		c := NewClient(testImpl, &ClientOptions{ResourceSubscriptionEndedHandler: rec.handler})
+		cs, err := c.Connect(ctx, ct, &ClientSessionOptions{ProtocolVersion: protocolVersion20260728})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+
+		for _, uri := range []string{"file:///r1", "file:///r2"} {
+			if err := cs.Subscribe(ctx, &SubscribeParams{URI: uri}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		synctest.Wait()
+		if n := len(subCh); n != 2 {
+			t.Fatalf("server accepted %d subscriptions, want 2", n)
+		}
+
+		if err := cs.Unsubscribe(ctx, &UnsubscribeParams{URI: "file:///r1"}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if n := len(unsubCh); n != 1 {
+			t.Fatalf("server ended %d subscriptions after Unsubscribe, want 1", n)
+		}
+
+		cs.Close()
+		synctest.Wait()
+
+		if calls := rec.get(); len(calls) != 0 {
+			t.Errorf("handler called %d times for listens the client ended, want 0", len(calls))
+		}
+	})
+}
+
+// TestResourceSubscriptionEndedHandler_NotCalledWhenUnsubscribeWinsTheRace
+// covers the window in which Unsubscribe has removed a URI's entry and not yet
+// cancelled its listen. A listen the server ends inside that window was still
+// ended at the client's request, so it is not reported.
+func TestResourceSubscriptionEndedHandler_NotCalledWhenUnsubscribeWinsTheRace(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		release := make(chan struct{})
+		server := NewServer(testImpl, &ServerOptions{
+			SubscribeHandler: func(_ context.Context, r *SubscribeRequest) error {
+				<-release
+				return ResourceNotFoundError(r.Params.URI)
+			},
+			UnsubscribeHandler: func(context.Context, *UnsubscribeRequest) error { return nil },
+		})
+		server.AddResource(&Resource{Name: "r1", URI: "file:///r1"}, nil)
+		ct, st := NewInMemoryTransports()
+		ss, err := server.Connect(ctx, st, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ss.Close()
+
+		var rec endedRecorder
+		c := NewClient(testImpl, &ClientOptions{ResourceSubscriptionEndedHandler: rec.handler})
+		cs, err := c.Connect(ctx, ct, &ClientSessionOptions{ProtocolVersion: protocolVersion20260728})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer cs.Close()
+
+		if err := cs.Subscribe(ctx, &SubscribeParams{URI: "file:///r1"}); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+
+		// The first half of Unsubscribe: the entry is gone, the listen is not
+		// cancelled yet.
+		cs.resourceSubsMu.Lock()
+		sub := cs.resourceSubs["file:///r1"]
+		delete(cs.resourceSubs, "file:///r1")
+		cs.resourceSubsMu.Unlock()
+
+		close(release)
+		synctest.Wait()
+		sub.cancel()
+
+		if calls := rec.get(); len(calls) != 0 {
+			t.Errorf("handler called %d times for a listen the client was ending, want 0", len(calls))
+		}
+	})
+}

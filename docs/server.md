@@ -242,7 +242,11 @@ later sessions the SDK delivers these notifications over a
 `subscriptions/listen` stream instead of the legacy `resources/subscribe`
 RPC; see [Subscriptions
 (`subscriptions/listen`)](protocol.md#subscriptions)
-for the wire-level details.
+for the wire-level details. On those sessions `Subscribe` returns before the
+server answers, so set
+[`ClientOptions.ResourceSubscriptionEndedHandler`](https://pkg.go.dev/github.com/modelcontextprotocol/go-sdk/mcp#ClientOptions.ResourceSubscriptionEndedHandler)
+to learn when a subscription ends without the client ending it, for example
+because the server refused it, ended its stream, or the connection failed.
 
 **Server-side**:
 Use

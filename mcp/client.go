@@ -180,6 +180,34 @@ type ClientOptions struct {
 	PromptListChangedHandler   func(context.Context, *PromptListChangedRequest)
 	ResourceListChangedHandler func(context.Context, *ResourceListChangedRequest)
 	ResourceUpdatedHandler     func(context.Context, *ResourceUpdatedNotificationRequest)
+	// ResourceSubscriptionEndedHandler, if non-nil, is called when the
+	// subscriptions/listen stream behind a [ClientSession.Subscribe] ends for
+	// a reason other than a client-initiated [ClientSession.Unsubscribe] or
+	// [ClientSession.Close]: for example, the server refused the subscription
+	// or ended the stream, the connection carrying it failed, or a sending
+	// middleware failed the request.
+	//
+	// It applies to sessions on protocol version 2026-07-28 or later, where
+	// Subscribe returns before the server answers. On earlier versions
+	// Subscribe returns the server's answer itself.
+	//
+	// Close does not report the streams it ends, but the handler can still run
+	// during or after Close: for a stream that ended just before Close removed
+	// it, and for a Subscribe made while the session was closing or closed,
+	// which is reported with an error wrapping [ErrConnectionClosed].
+	//
+	// The URI is no longer subscribed when the handler is called, so the
+	// handler may call Subscribe for it again. The SDK does not resubscribe on
+	// its own, and a handler that does should not do so unconditionally: a
+	// server that keeps refusing the URI ends the new stream at once, and so
+	// does a closed connection, with an error wrapping [ErrConnectionClosed].
+	//
+	// The handler runs on the goroutine that awaited the stream, so calls may
+	// run concurrently, including two for the same URI once the handler has
+	// subscribed to it again. Its context is not cancelled when the session
+	// closes, and carries none of the values of the context passed to
+	// Subscribe.
+	ResourceSubscriptionEndedHandler func(context.Context, *ResourceSubscriptionEndedRequest)
 	// LoggingMessageHandler handles incoming notifications/message
 	// notifications from the server.
 	//
@@ -515,6 +543,24 @@ type ClientSession struct {
 type resourceSub struct {
 	cancel context.CancelFunc
 	gen    uint64
+}
+
+// ResourceSubscriptionEndedRequest describes a resource subscription whose
+// subscriptions/listen stream ended without the client ending it. It is passed
+// to [ClientOptions.ResourceSubscriptionEndedHandler].
+type ResourceSubscriptionEndedRequest struct {
+	// Session is the session that held the subscription.
+	Session *ClientSession
+	// URI is the resource whose subscription ended.
+	URI string
+	// Err is the error the stream ended with, such as the server's refusal,
+	// an error the server ended the stream with, a transport error, or an
+	// error from a sending middleware. It is nil when the server ended the
+	// stream with a result.
+	Err error
+	// Graceful reports whether the stream ended with a result rather than an
+	// error.
+	Graceful bool
 }
 
 type clientSessionState struct {
@@ -1477,14 +1523,15 @@ func (cs *ClientSession) Subscribe(ctx context.Context, params *SubscribeParams)
 // "terminated" error, or any jsonrpc error, all while listenCtx is not
 // cancelled — the resourceSubs entries for the stream's resource URIs are
 // cleared so that a later bare Subscribe re-opens the stream instead of
-// no-oping. An entry is only removed if it still carries generation gen, which
+// no-oping, and then reported to [ClientOptions.ResourceSubscriptionEndedHandler].
+// An entry is only removed if it still carries generation gen, which
 // guards an Unsubscribe→Subscribe race and a re-subscribe from inside a
 // callback. The SDK does not auto-resubscribe: a revoked URI would hot-loop, so
 // reopening is left to the application calling Subscribe again. Connect passes
 // a nil gen for its list-changed listen, which owns no resource entries, so
 // its end clears nothing.
 func (cs *ClientSession) awaitSubscriptionsListen(listenCtx context.Context, params *SubscriptionsListenParams, gen *uint64) {
-	_ = cs.subscriptionsListen(listenCtx, params)
+	err := cs.subscriptionsListen(listenCtx, params)
 	if listenCtx.Err() != nil {
 		// Client-initiated teardown: Unsubscribe already removed the entry (and
 		// cancelAllResourceSubscriptions nils the whole map on Close), so there
@@ -1495,8 +1542,28 @@ func (cs *ClientSession) awaitSubscriptionsListen(listenCtx context.Context, par
 		return
 	}
 	for _, uri := range params.Notifications.ResourceSubscriptions {
-		cs.clearResourceSubIfGen(uri, *gen)
+		// An entry already gone was removed by Unsubscribe or Close, which
+		// ended the subscription even if the server ended the stream first.
+		if cs.clearResourceSubIfGen(uri, *gen) {
+			cs.client.callResourceSubscriptionEndedHandler(listenCtx, cs, uri, err)
+		}
 	}
+}
+
+// callResourceSubscriptionEndedHandler reports to
+// [ClientOptions.ResourceSubscriptionEndedHandler] that the subscription to
+// uri ended with err.
+func (c *Client) callResourceSubscriptionEndedHandler(ctx context.Context, cs *ClientSession, uri string, err error) {
+	h := c.opts.ResourceSubscriptionEndedHandler
+	if h == nil {
+		return
+	}
+	h(ctx, &ResourceSubscriptionEndedRequest{
+		Session:  cs,
+		URI:      uri,
+		Err:      err,
+		Graceful: err == nil,
+	})
 }
 
 // clearResourceSubIfGen deletes the resourceSubs entry for uri only if it is
